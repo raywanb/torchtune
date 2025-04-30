@@ -37,8 +37,169 @@ from contextlib import nullcontext
 import contextlib
 from green_ctx.utils import set_cublas_sm_count
 from tqdm import tqdm
+import re
+from vllm.gtx_client import GtxClient
+from torchtune.models.convert_weights import _FROM_HF
 
 log = utils.get_logger("DEBUG")
+from torchtune.models.convert_weights import tune_to_hf  # Assuming you import tune_to_hf from your code
+
+from torchtune.models.convert_weights import _FROM_HF, get_mapped_key
+
+
+def get_gtx_allocation_name(
+    name: str,
+    mapping_dict: dict,
+    skip_keys: Tuple[str, ...] = ("q_proj", "k_proj"),
+    model_prefix: str = "meta-llama/Meta-Llama-3.1-8B-Instruct",
+) -> str:
+    """
+    Returns the GTX allocation name for a given torchtune parameter key.
+    For keys like q_proj/k_proj (or v_proj if needed), the name is kept raw since
+    they will be handled as part of the fused tensor allocation.
+    """
+    for skip in skip_keys:
+        if skip in name:
+            # For the fused qkv keys, we could leave the name unchanged (or
+            # optionally add logic if different treatment is desired)
+            return name
+
+    try:
+        # Invert the mapping for non-fused parameters
+        inverted_map = {v: k for k, v in mapping_dict.items() if v is not None}
+        hf_key = get_mapped_key(name, inverted_map)
+        return hf_key
+    except Exception:
+        # Fallback to the original name if mapping fails
+        return name
+
+
+def _gtx_replace_model_weights_from_tune(
+    model: nn.Module,
+    num_heads=32,
+    num_kv_heads=32,
+    dim=4096,
+    head_dim=None,
+) -> Tuple[bool, nn.Module]:
+    client = GtxClient.get()
+    need_init = False
+    inverted_mapping = {v: k for k, v in _FROM_HF.items() if v is not None}
+
+    qkv_groups = {}
+    gate_up_groups = {}
+
+    for name, param in model.named_parameters():
+        if "lora_" in name or "magnitude" in name:
+            continue
+
+        if any(x in name for x in ("q_proj", "k_proj", "v_proj")):
+            layer_key = ".".join(name.split(".")[:2])
+            proj_type = name.split(".")[-2]  # e.g. q_proj
+            qkv_groups.setdefault(layer_key, {})[proj_type] = (name, param)
+            continue
+        
+        if any(x in name for x in ("w1", "w3")): 
+            layer_key = ".".join(name.split(".")[:2])
+            proj_type = name.split(".")[-2]  # e.g. q_proj
+            gate_up_groups.setdefault(layer_key, {})[proj_type] = (name, param)
+            continue
+
+
+        # Non-qkv weights
+        full_name = get_gtx_allocation_name(name, _FROM_HF)
+        client.lock_tensor(full_name)
+        if client.exists_tensor(full_name):
+            gtx_tensor = client.get_tensor(full_name)
+        else:
+            gtx_tensor = client.alloc_tensor(
+                shape=list(param.shape),
+                dtype=str(param.dtype).split(".")[-1],
+                name=full_name,
+            )
+            need_init = True
+        client.unlock_tensor(full_name)
+        param.data = gtx_tensor
+
+    # Handle qkv fused allocation
+    for layer_key, parts in qkv_groups.items():
+        try:
+            q_name, q_param = parts["q_proj"]
+            k_name, k_param = parts["k_proj"]
+            v_name, v_param = parts["v_proj"]
+        except KeyError:
+            raise ValueError(f"Missing q/k/v_proj in {layer_key}")
+
+        q_shape = q_param.shape
+        k_shape = k_param.shape
+        v_shape = v_param.shape
+
+        assert q_shape[1] == k_shape[1] == v_shape[1], f"Dim mismatch in {layer_key}"
+
+        qkv_shape = (q_shape[0] + k_shape[0] + v_shape[0], q_shape[1])
+
+        hf_qkv_name = f"model.{layer_key}.self_attn.qkv_proj.weight"
+
+        client.lock_tensor(hf_qkv_name)
+        if client.exists_tensor(hf_qkv_name):
+            qkv_tensor = client.get_tensor(hf_qkv_name)
+        else:
+            qkv_tensor = client.alloc_tensor(
+                shape=list(qkv_shape),
+                dtype=str(q_param.dtype).split(".")[-1],
+                name=hf_qkv_name,
+            )
+            need_init = True
+        client.unlock_tensor(hf_qkv_name)
+
+        q_end = q_shape[0]
+        k_end = q_end + k_shape[0]
+        v_end = k_end + v_shape[0]
+
+        q_param.data = qkv_tensor[:q_end]
+        k_param.data = qkv_tensor[q_end:k_end]
+        v_param.data = qkv_tensor[k_end:v_end]
+
+        log.info(f"Assigned fused qkv_proj for {layer_key}: shape {qkv_shape}")
+    
+    for layer_key, parts in gate_up_groups.items():
+
+        try:
+            gate_name, gate_param = parts['w1']
+            up_name, up_param = parts['w3']
+        except KeyError:
+            raise ValueError(f"Missing gate/up_proj in {layer_key}")
+        
+        gate_shape = gate_param.shape
+        up_shape = up_param.shape
+
+        assert gate_shape[1] == up_shape[1], f"Dim mismatch in {layer_key}"
+
+        fused_shape = (gate_shape[0] + up_shape[0], gate_shape[1])
+        hf_gate_up_name = f"model.{layer_key}.mlp.gate_up_proj.weight"
+
+        client.lock_tensor(hf_gate_up_name)
+        if client.exists_tensor(hf_gate_up_name):
+            fused_tensor = client.get_tensor(hf_gate_up_name)
+        else:
+            fused_tensor = client.alloc_tensor(
+                shape=list(fused_shape),
+                dtype=str(gate_param.dtype).split(".")[-1],
+                name=hf_gate_up_name,
+            )
+            need_init = True
+        client.unlock_tensor(hf_gate_up_name)
+
+        gate_end = gate_shape[0]
+        up_end = gate_end + up_shape[0]
+
+        gate_param.data = fused_tensor[:gate_end]
+        up_param.data = fused_tensor[gate_end:up_end]
+
+        log.info(f"Assigned fused gate_up_proj for {layer_key}: shape {fused_shape}")
+
+
+    torch.cuda.empty_cache()
+    return need_init, model
 
 
 class LoRAFinetuneRecipeSingleDevice(FTRecipeInterface):
@@ -47,14 +208,14 @@ class LoRAFinetuneRecipeSingleDevice(FTRecipeInterface):
     for single GPU training. Training on CPU is not supported.
 
     Features:
-        - Activation Checkpointing. This can be controlled using the ``enable_activation_checkpointing``
+        - Activation Checkpointing. This can be controlled using the `enable_activation_checkpointing
             flag. Activation checkpointing helps reduce the memory footprint since we no longer keep
             activations in memory and instead recompute them during the backward pass. This is especially
             helpful for larger batch sizes when you're memory constrained. But these savings in memory
             come at the cost of training performance. In most cases training can slow-down quite a bit as
             a result of this activation recomputation.
 
-        - Activation Offloading. This can be controlled using the ``enable_activation_offloading``
+        - Activation Offloading. This can be controlled using the `enable_activation_offloading
             flag. Activation offloading is a technique similar to activations checkpointing that helps
             reduce the memory footprint to prevent OOMs on CUDA and enable bigger batches. Where activations
             checkpointing drops the activation in the forward to recompute it later in the backward,
@@ -66,15 +227,15 @@ class LoRAFinetuneRecipeSingleDevice(FTRecipeInterface):
             be enabled by default if an acceptable torch version is found. Activation offloading can be
             used in conjunction with activation checkpointing.
 
-        - Precision. Full fp32 and bf16 training are supported. Precision is controlled using the ``dtype``
-            flag. When ``dtype=bf16``, all activations, gradients and optimizer states are in bfloat16. In
+        - Precision. Full fp32 and bf16 training are supported. Precision is controlled using the `dtype
+            flag. When `dtype=bf16, all activations, gradients and optimizer states are in bfloat16. In
             most cases this should halve the memory footprint of full precision (fp32) training, without
             loss in model quality (will depend on the model, training data and other settings). For
             GPUs which do not support bfloat16, we fall back to fp32. Mixed precision training and fp16
             precision are currently not supported.
 
         - Gradient Accumulation. You can simulate larger batch sizes by accumulating gradients. This is
-            controlled using the ``gradient_accumulation_steps`` flag.
+            controlled using the `gradient_accumulation_steps flag.
 
                 Total Batch Size = batch_size * gradient accumulation steps.
 
@@ -96,7 +257,7 @@ class LoRAFinetuneRecipeSingleDevice(FTRecipeInterface):
 
             Optimizer State and recipe state (seed, total_epochs, number of epochs run etc) are
             only saved at the end of a given epoch and used in case of resuming training. Resuming
-            training is controlled by the ``resume_from_checkpoint`` flag. Mid-epoch checkpointing is
+            training is controlled by the `resume_from_checkpoint flag. Mid-epoch checkpointing is
             currently not supported.
 
             For more details on the checkpointer, please take a look at
@@ -104,26 +265,27 @@ class LoRAFinetuneRecipeSingleDevice(FTRecipeInterface):
 
         - Logging. Terminal, Disk, WandB and TensorBoard are all supported.
 
-        - Gradient Clipping. Gradient clipping is supported using the ``clip_grad_norm`` flag. By default,
-            ``clip_grad_norm`` is set to ``None``. If you only want to log the grad norm, you can set
-            ``clip_grad_norm='inf'``.
+        - Gradient Clipping. Gradient clipping is supported using the `clip_grad_norm flag. By default,
+            `clip_grad_norm is set to None. If you only want to log the grad norm, you can set
+            `clip_grad_norm='inf'.
 
-    For a full list of example configs for this recipe, run ``tune ls`` on the command line. Each config
+    For a full list of example configs for this recipe, run `tune ls on the command line. Each config
     has example commands for how to kick-off training.
 
     Args:
         cfg (DictConfig): OmegaConf object parsed from yaml file
 
     Raises:
-        ValueError: If ``dtype`` is set to fp16.
-        RuntimeError: If ``dtype`` is set to bf16 and the hardware does not support bf16.
-        RuntimeError: If ``enable_activation_offloading`` is True and device is not CUDA.
-        RuntimeError: If ``enable_activation_offloading`` is True and ``enable_activation_checkpointing`` is False.
-        RuntimeError: If ``left_pad_sequence`` is set as the data collator
+        ValueError: If `dtype is set to fp16.
+        RuntimeError: If `dtype is set to bf16 and the hardware does not support bf16.
+        RuntimeError: If `enable_activation_offloading is True and device is not CUDA.
+        RuntimeError: If `enable_activation_offloading is True and enable_activation_checkpointing is False.
+        RuntimeError: If `left_pad_sequence is set as the data collator
 
     """
 
     def __init__(self, cfg: DictConfig) -> None:
+        self.gtx_client = GtxClient.init(model_name="meta-llama/Meta-Llama-3.1-8B-Instruct")
         self._device = utils.get_device(device=cfg.device)
         # Reduced precision logic
         self._dtype = training.get_dtype(cfg.dtype, device=self._device)
@@ -146,7 +308,7 @@ class LoRAFinetuneRecipeSingleDevice(FTRecipeInterface):
             self._log_peak_memory_stats = False
 
         # These are public properties which are updated by the checkpoint loader
-        # when ``resume_from_checkpoint`` is `True` or validated in tests
+        # when `resume_from_checkpoint is True or validated in tests
         self.seed = training.set_seed(seed=cfg.seed)
         self.epochs_run = 0
         self.total_epochs = cfg.epochs
@@ -258,7 +420,7 @@ class LoRAFinetuneRecipeSingleDevice(FTRecipeInterface):
         self._compile = cfg.compile
         if cfg.device == "npu" and cfg.compile:
             raise ValueError(
-                "NPU does not support model compilation. Please set `compile: False` in the config."
+                "NPU does not support model compilation. Please set compile: False in the config."
             )
         checkpoint_dict = self.load_checkpoint(cfg_checkpointer=cfg.checkpointer)
 
@@ -346,8 +508,8 @@ class LoRAFinetuneRecipeSingleDevice(FTRecipeInterface):
             last_epoch=self.global_step - 1,
         )
 
-        # Set up profiler, returns DummyProfiler (nullcontext object with no-op `step` method)
-        # if cfg is missing profiler key or if `cfg.profiler.enabled = False
+        # Set up profiler, returns DummyProfiler (nullcontext object with no-op step method)
+        # if cfg is missing profiler key or if cfg.profiler.enabled = False
         self._profiler = self._setup_profiler(cfg.get(PROFILER_KEY, None))
 
         # Used to ignore labels for loss computation
@@ -359,18 +521,18 @@ class LoRAFinetuneRecipeSingleDevice(FTRecipeInterface):
         self, cfg_profiler: Optional[DictConfig] = None
     ) -> Union[torch.profiler.profile, DummyProfiler]:
         """
-        Parses the `profiler` section of top-level `cfg` and sets up profiler
+        Parses the profiler section of top-level cfg and sets up profiler
 
         Args:
-            cfg_profiler (Optional[DictConfig]): ``profiler`` section of the top-level ``cfg`` (the main config passed to
-                `recipe.main`). Default None.
+            cfg_profiler (Optional[DictConfig]): `profiler section of the top-level cfg (the main config passed to
+                recipe.main). Default None.
 
         Returns:
             profiler: Union[torch.profiler.profile, DummyProfiler] - DummyProfiler is a nullcontext with no-op methods
-            for `start`, `stop`, and `step` that can be used in place of `torch.profiler.profile` if profiler is not enabled such
+            for start, stop, and step that can be used in place of torch.profiler.profile if profiler is not enabled such
             that the instrumented training loop does not need to be changed profiling is disabled.
 
-        The profiler config can be provided in configs under the `profiler` key with the following layout:
+        The profiler config can be provided in configs under the profiler key with the following layout:
 
         .. code-block:: yaml
             profiler:
@@ -379,7 +541,7 @@ class LoRAFinetuneRecipeSingleDevice(FTRecipeInterface):
                 #Output directory of trace artifacts
                 output_dir: str
 
-            #`torch.profiler.ProfilerActivity` types to trace
+            #torch.profiler.ProfilerActivity types to trace
             cpu: bool
             cuda: bool
 
@@ -389,7 +551,7 @@ class LoRAFinetuneRecipeSingleDevice(FTRecipeInterface):
                 record_shapes: bool
                 with_flops: bool
 
-            # `torch.profiler.schedule` options:
+            # torch.profiler.schedule options:
             # wait_steps -> wait, warmup_steps -> warmup, active_steps -> active, num_cycles -> repeat
             wait_steps: int
             warmup_steps: int
@@ -408,7 +570,7 @@ class LoRAFinetuneRecipeSingleDevice(FTRecipeInterface):
             assert (
                 cfg_profiler.get("_component_")
                 == "torchtune.training.setup_torch_profiler"
-            ), "Only torch profiler supported currently: component must be `torchtune.training.setup_torch_profiler`"
+            ), "Only torch profiler supported currently: component must be torchtune.training.setup_torch_profiler"
 
         profiler, profiler_cfg = config.instantiate(cfg_profiler)
 
@@ -431,8 +593,14 @@ class LoRAFinetuneRecipeSingleDevice(FTRecipeInterface):
         base_model_state_dict: Dict[str, Any],
         lora_weights_state_dict: Optional[Dict[str, Any]] = None,
     ) -> nn.Module:
+        log.info("self._device %s", self._device)
         with training.set_default_dtype(self._dtype), self._device:
             model = config.instantiate(cfg_model)
+
+        log.info("%s", model.named_parameters())
+
+        _, model = _gtx_replace_model_weights_from_tune(model)
+
 
         self._lora_rank = cfg_model.lora_rank
         self._lora_alpha = cfg_model.lora_alpha
@@ -482,7 +650,6 @@ class LoRAFinetuneRecipeSingleDevice(FTRecipeInterface):
         training.validate_expected_param_dtype(
             self.adapter_params.items(), dtype=self._dtype
         )
-
         # activation offloading
         self.activations_handling_ctx = training.get_act_offloading_ctx_manager(
             model, enable_activation_offloading
@@ -584,7 +751,7 @@ class LoRAFinetuneRecipeSingleDevice(FTRecipeInterface):
         - Merged weights with key MODEL_KEY
         - Adapter weights with key ADAPTER_KEY
         - Relevant recipe state if training is not complete
-        - If the `self._save_adapter_weights_only` option is True, the checkpointer will save only the adapter weights
+        - If the self._save_adapter_weights_only option is True, the checkpointer will save only the adapter weights
 
         To correctly resume from training, the adapter weights and recipe state must be provided along with the base model weights.
         """
@@ -744,7 +911,7 @@ class LoRAFinetuneRecipeSingleDevice(FTRecipeInterface):
                             and self._device.type == "cuda"
                         ):
                             torch.cuda.memory._record_memory_history(enabled=None)
-
+                        log.info(f"%s", self.gtx_client.health_check())
                         prof.step()
 
                     self.epochs_run += 1
@@ -864,7 +1031,6 @@ class LoRAFinetuneRecipeSingleDevice(FTRecipeInterface):
                             and self._device.type == "cuda"
                         ):
                             torch.cuda.memory._record_memory_history(enabled=None)
-
                         prof.step()
 
                     self.epochs_run += 1
@@ -886,7 +1052,7 @@ def recipe_main(cfg: DictConfig) -> None:
     Entry point for the recipe.
 
     Configurable parameters are read in the following order:
-        - Parameters specified in config (see available configs through ``tune ls``)
+        - Parameters specified in config (see available configs through `tune ls)
         - Overwritten by arguments from the command-line
     """
     config.log_config(recipe_name="LoRAFinetuneRecipeSingleDevice", cfg=cfg) 
