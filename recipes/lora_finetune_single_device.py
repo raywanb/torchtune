@@ -32,7 +32,7 @@ from torchtune.modules.peft import (
 )
 from torchtune.recipe_interfaces import FTRecipeInterface
 from torchtune.training import DummyProfiler, PROFILER_KEY
-from green_ctx import init as init_cuda, get_sms_in_range, make_shard
+from green_ctx import init as init_cuda, get_sms_in_range, make_shard, get_sms_by_spec
 from contextlib import nullcontext
 import contextlib
 from green_ctx.utils import set_cublas_sm_count
@@ -40,7 +40,6 @@ from tqdm import tqdm
 import re
 from vllm.gtx_client import GtxClient
 from torchtune.models.convert_weights import _FROM_HF
-
 log = utils.get_logger("DEBUG")
 from torchtune.models.convert_weights import tune_to_hf  # Assuming you import tune_to_hf from your code
 
@@ -434,6 +433,8 @@ class LoRAFinetuneRecipeSingleDevice(FTRecipeInterface):
 
         self.forward_sm_count = 104        # or None for default
         self.backward_sm_count = 40
+
+        self.experimental = cfg.get("experimental", False)
 
 
         # set up model
@@ -829,15 +830,52 @@ class LoRAFinetuneRecipeSingleDevice(FTRecipeInterface):
         del logits
 
         return loss
+
+    def ping_serving_batch_size(self) -> int:
+        """
+        Pings the serving batch size from the gtx client.
+
+        Returns:
+            int: The current serving batch size.
+        """
+        try:
+            return self.gtx_client.health_check().get("request_rate", 0)
+        except Exception as e:
+            log.error("Failed to ping serving batch size: %s", str(e))
+            return 0
     
+    def wait_for_low_request_load(self, threshold: int = 8, sleep_time: int = 20) -> None:
+        """
+        Pauses training until the serving batch size drops below the given threshold.
+
+        Args:
+            threshold (int): The serving request threshold above which training pauses.
+            sleep_time (int): The time in seconds to wait before re-checking.
+        """
+        while self.ping_serving_batch_size() >= threshold:
+            current_load = self.ping_serving_batch_size()
+            log.info(
+                "High request load detected (%d >= %d). Pausing LoRA tuning for %d seconds.",
+                current_load, threshold, sleep_time
+            )
+            time.sleep(sleep_time)
+
+
     def train(self) -> None:
         """
-        The core training loop.
+        Training loop with SM-aware stream swapping that alternates every global step.
+
+        Pre-creates two green contexts/streams:
+        - LOW SM context: uses 8 SMs.
+        - HIGH SM context: uses the full/preconfigured SM count.
+
+        When experimental is enabled:
+        - Always uses 8 SMs.
+        - If the serving request count is 8 or more, pauses LoRA tuning by invoking
+            wait_for_low_request_load(), which checks the load every 20 seconds until it's below 8.
         """
         if self._compile:
-            log.info(
-                "NOTE: torch.compile is enabled and model is compiled in first forward. Expect a relatively slow first iteration."
-            )
+            log.info("NOTE: torch.compile is enabled. First iteration may be slower.")
 
         t0 = time.perf_counter()
         running_loss = 0
@@ -849,154 +887,46 @@ class LoRAFinetuneRecipeSingleDevice(FTRecipeInterface):
                 for curr_epoch in range(self.epochs_run, self.total_epochs):
                     self._sampler.set_epoch(curr_epoch)
                     pbar = tqdm(total=self._steps_per_epoch)
-                    for idx, batch in enumerate(self._dataloader):
-                        if (
-                            self.max_steps_per_epoch is not None
-                            and (idx // self._gradient_accumulation_steps)
-                            == self.max_steps_per_epoch
-                        ):
-                            break
+                    data_iter = iter(self._dataloader)
 
-                        if (
-                            curr_epoch == 0
-                            and self.profiler_profile_memory
-                            and idx == self.profiler_wait_steps + self.profiler_warmup_steps
-                            and self._device.type == "cuda"
-                        ):
-                            torch.cuda.memory._record_memory_history()
+                    for _ in range(self._steps_per_epoch):
+                        # Dynamically select SM context based on serving load
+                        request_rate = self.ping_serving_batch_size()
+                        if request_rate >= 8:
+                            current_sm = 8
+                            stream = low_stream
+                            log.info(
+                                "Epoch %d, Global Step %d: High request rate (%d). Using LOW SM context.",
+                                curr_epoch, self.global_step, request_rate
+                            )
+                        else:
+                            current_sm = high_sm_count
+                            stream = high_stream
+                            log.info(
+                                "Epoch %d, Global Step %d: Low request rate (%d). Using HIGH SM context (%d SMs).",
+                                curr_epoch, self.global_step, request_rate, high_sm_count
+                            )
 
-                        utils.batch_to_device(batch, self._device)
-                        current_num_tokens = (batch["labels"] != self._loss_fn.ignore_index).sum()
-                        num_tokens += current_num_tokens
-                        current_loss = self._loss_step(batch) * current_num_tokens
-                        running_loss += current_loss
-                        current_loss.backward()
+                        with set_cublas_sm_count(current_sm), torch.cuda.stream(stream):
+                            for _ in range(self._gradient_accumulation_steps):
+                                try:
+                                    batch = next(data_iter)
+                                except StopIteration:
+                                    data_iter = iter(self._dataloader)
+                                    batch = next(data_iter)
 
-                        if (idx + 1) % self._gradient_accumulation_steps == 0:
-                            training.scale_grads(self._model, 1 / num_tokens)
-                            if self._clip_grad_norm is not None:
-                                grad_norm = torch.nn.utils.clip_grad_norm_(
-                                    self._model.parameters(),
-                                    max_norm=float(self._clip_grad_norm),
-                                )
-                            self._optimizer.step()
-                            self._optimizer.zero_grad(set_to_none=True)
-                            self._lr_scheduler.step()
-                            self.global_step += 1
-                            loss_to_log = running_loss.item() / num_tokens
-                            pbar.update(1)
-                            pbar.set_description(f"{curr_epoch + 1}|{self.global_step}|Loss: {loss_to_log}")
-
-                            if self.global_step % self._log_every_n_steps == 0:
-                                time_per_step = time.perf_counter() - t0
-                                log_dict = {
-                                    "loss": loss_to_log,
-                                    "lr": self._optimizer.param_groups[0]["lr"],
-                                    "tokens_per_second_per_gpu": num_tokens / time_per_step,
-                                }
-                                if self._device.type != "cpu" and self._log_peak_memory_stats:
-                                    log_dict.update(training.get_memory_stats(device=self._device))
-                                if self._clip_grad_norm is not None:
-                                    log_dict.update({"grad_norm": grad_norm})
-                                self._metric_logger.log_dict(log_dict, step=self.global_step)
-
-                            running_loss = 0
-                            num_tokens = 0
-                            t0 = time.perf_counter()
-
-                        if (
-                            curr_epoch == 0
-                            and self.profiler_profile_memory
-                            and idx == self.profiler_wait_steps + self.profiler_warmup_steps + self.profiler_active_steps
-                            and self._device.type == "cuda"
-                        ):
-                            torch.cuda.memory._record_memory_history(enabled=None)
-                        log.info(f"%s", self.gtx_client.health_check())
-                        prof.step()
-
-                    self.epochs_run += 1
-                    start_save_checkpoint = time.perf_counter()
-                    log.info("Starting checkpoint save...")
-                    self.save_checkpoint(epoch=curr_epoch)
-                    log.info("Checkpoint saved in {:.2f} seconds.".format(time.perf_counter() - start_save_checkpoint))
-
-        if self.use_green_sms:
-            green_sms = (self.green_sms_upper - self.green_sms_lower) + (4 if self.green_sms_use_remaining else 0)
-            self.green_ctx = get_sms_in_range(self.green_sms_lower, self.green_sms_upper, self.green_sms_use_remaining)
-            log.info("SM COUNT %d", self.green_ctx.sm_count)
-            green_stream = self.green_ctx.make_stream()
-            stream_handle = int(green_stream)
-            torch_stream = torch.cuda.ExternalStream(stream_handle)
-            with set_cublas_sm_count(green_sms), torch.cuda.stream(torch_stream):
-                run_loop()
-        else:
-            run_loop()
-
-    def train1(self) -> None:
-        if self._compile:
-            log.info("NOTE: torch.compile is enabled and model is compiled in first forward.")
-
-        t0 = time.perf_counter()
-        running_loss = 0
-        num_tokens = 0
-
-        def make_green_env(sm_count):
-            if sm_count is None:
-                return None, torch.cuda.default_stream()
-            green_ctx = get_sms_in_range(0, sm_count, True)
-            stream = green_ctx.make_stream()
-            torch_stream = torch.cuda.ExternalStream(int(stream))
-            return sm_count, torch_stream
-
-        # Setup per-phase SM + stream
-        fwd_sm, fwd_stream = make_green_env(getattr(self, "forward_sm_count", None))
-        bwd_sm, bwd_stream = make_green_env(getattr(self, "backward_sm_count", None))
-        opt_sm, opt_stream = make_green_env(getattr(self, "optimizer_sm_count", None))
-
-        def run_loop():
-            nonlocal t0, running_loss, num_tokens
-            with self._profiler as prof:
-                for curr_epoch in range(self.epochs_run, self.total_epochs):
-                    self._sampler.set_epoch(curr_epoch)
-                    pbar = tqdm(total=self._steps_per_epoch)
-                    for idx, batch in enumerate(self._dataloader):
-                        if (
-                            self.max_steps_per_epoch is not None
-                            and (idx // self._gradient_accumulation_steps)
-                            == self.max_steps_per_epoch
-                        ):
-                            break
-
-                        if (
-                            curr_epoch == 0
-                            and self.profiler_profile_memory
-                            and idx == self.profiler_wait_steps + self.profiler_warmup_steps
-                            and self._device.type == "cuda"
-                        ):
-                            torch.cuda.memory._record_memory_history()
-
-                        utils.batch_to_device(batch, self._device)
-                        current_num_tokens = (batch["labels"] != self._loss_fn.ignore_index).sum()
-                        num_tokens += current_num_tokens
-
-                        # --- FORWARD PASS ---
-                        with set_cublas_sm_count(fwd_sm) if fwd_sm else contextlib.nullcontext():
-                            with torch.cuda.stream(fwd_stream):
+                                utils.batch_to_device(batch, self._device)
+                                current_num_tokens = (batch["labels"] != self._loss_fn.ignore_index).sum()
+                                num_tokens += current_num_tokens
                                 current_loss = self._loss_step(batch) * current_num_tokens
-                        running_loss += current_loss
-
-                        # --- BACKWARD PASS ---
-                        with set_cublas_sm_count(bwd_sm) if bwd_sm else contextlib.nullcontext():
-                            with torch.cuda.stream(bwd_stream):
+                                running_loss += current_loss
                                 current_loss.backward()
 
-                        # --- OPTIMIZER STEP ---
-                        if (idx + 1) % self._gradient_accumulation_steps == 0:
                             training.scale_grads(self._model, 1 / num_tokens)
                             if self._clip_grad_norm is not None:
                                 grad_norm = torch.nn.utils.clip_grad_norm_(
                                     self._model.parameters(),
-                                    max_norm=float(self._clip_grad_norm),
+                                    max_norm=float(self._clip_grad_norm)
                                 )
                             self._optimizer.step()
                             self._optimizer.zero_grad(set_to_none=True)
@@ -1024,22 +954,36 @@ class LoRAFinetuneRecipeSingleDevice(FTRecipeInterface):
                             num_tokens = 0
                             t0 = time.perf_counter()
 
-                        if (
-                            curr_epoch == 0
-                            and self.profiler_profile_memory
-                            and idx == self.profiler_wait_steps + self.profiler_warmup_steps + self.profiler_active_steps
-                            and self._device.type == "cuda"
-                        ):
-                            torch.cuda.memory._record_memory_history(enabled=None)
                         prof.step()
 
                     self.epochs_run += 1
                     start_save_checkpoint = time.perf_counter()
                     log.info("Starting checkpoint save...")
                     self.save_checkpoint(epoch=curr_epoch)
-                    log.info("Checkpoint saved in {:.2f} seconds.".format(time.perf_counter() - start_save_checkpoint))
+                    log.info("Checkpoint saved in {:.2f} seconds.".format(
+                        time.perf_counter() - start_save_checkpoint
+                    ))
 
-        run_loop()
+
+        if self.use_green_sms:
+            log.info("Initializing dual green SM contexts for alternating global steps...")
+
+            low_sm_ctx_obj = get_sms_in_range(0, 8, False)
+            low_sm_count = low_sm_ctx_obj.sm_count
+            low_stream_handle = int(low_sm_ctx_obj.make_stream())
+            low_stream = torch.cuda.ExternalStream(low_stream_handle)
+
+            high_sm_ctx_obj = get_sms_in_range(
+                self.green_sms_lower, self.green_sms_upper, self.green_sms_use_remaining
+            )
+            high_sm_count = high_sm_ctx_obj.sm_count
+            high_stream_handle = int(high_sm_ctx_obj.make_stream())
+            high_stream = torch.cuda.ExternalStream(high_stream_handle)
+
+            log.info("Dual green SM contexts created: LOW=%d SMs, HIGH=%d SMs", low_sm_count, high_sm_count)
+            run_loop()
+        else:
+            run_loop()
 
 
     def cleanup(self) -> None:
@@ -1057,8 +1001,6 @@ def recipe_main(cfg: DictConfig) -> None:
     """
     config.log_config(recipe_name="LoRAFinetuneRecipeSingleDevice", cfg=cfg) 
     
-    # Initialize CUDA but don't create the green context here
-    init_cuda()
     
     # Create the recipe and run training normally
     recipe = LoRAFinetuneRecipeSingleDevice(cfg=cfg)
