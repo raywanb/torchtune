@@ -97,6 +97,12 @@ use-green-sms: True
 green-sms-lower-range: 0
 green-sms-upper-range: 104
 green-sms-use-remaining: True
+
+
+experimental: False
+low-sm-count: 8
+high-sm-count: 96
+
 # Profiler (disabled)
 profiler:
   _component_: torchtune.training.setup_torch_profiler

@@ -194,7 +194,7 @@ def padded_collate_sft(
         padding_value=padding_idx,
     )
     labels = pad_sequence(
-        [torch.tensor(x["labels"]) for x in batch],
+        [torch.tensor(x["labels"], dtype=torch.long) for x in batch],
         batch_first=True,
         padding_value=ignore_idx,
     )
